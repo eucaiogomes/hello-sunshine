@@ -1,16 +1,19 @@
-// Update this page (the content is just a fallback if you fail to update the page)
+import { StudioProvider, useStudio } from "@/state/studio";
+import Home from "@/components/Home";
+import RecordStudio from "@/components/RecordStudio";
+import EditStudio from "@/components/EditStudio";
 
-// IMPORTANT: Fully REPLACE this with your own code
-const PlaceholderIndex = () => {
-  // PLACEHOLDER: Replace this entire return statement with the user's app.
-  // The inline background color is intentionally not part of the design system.
+function Inner() {
+  const { view } = useStudio();
+  if (view === "record") return <RecordStudio />;
+  if (view === "home") return <Home />;
+  return <EditStudio />;
+}
+
+export default function Index() {
   return (
-    <div className="flex min-h-screen items-center justify-center" style={{ backgroundColor: '#fcfbf8' }}>
-      <img data-lovable-blank-page-placeholder="REMOVE_THIS" src="/placeholder.svg" alt="Your app will live here!" />
-    </div>
+    <StudioProvider>
+      <Inner />
+    </StudioProvider>
   );
-};
-
-const Index = PlaceholderIndex;
-
-export default Index;
+}
