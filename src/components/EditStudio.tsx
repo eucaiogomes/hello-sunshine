@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   SkipBack, Play, Pause, SkipForward, Volume2, Maximize2, Scissors, Trash2, Save,
-  Video, Image as ImageIcon, ArrowLeft, List, Upload, Film, Music, Plus,
+  Video, Image as ImageIcon, ArrowLeft, List, Upload, Film, Music, Plus, MousePointer2,
 } from "lucide-react";
 import { useStudio } from "@/state/studio";
 import ChaptersPanel from "@/components/ChaptersPanel";
@@ -11,13 +11,13 @@ type Kind = "video" | "slide" | "audio" | "image";
 type Segment = {
   id: string;
   kind: Kind;
-  layer: number;          // 0 = top
-  start: number;          // absolute timeline position (sec)
-  srcStart: number;       // source-in
-  srcEnd: number;         // source-out
+  layer: number;
+  start: number;
+  srcStart: number;
+  srcEnd: number;
   label: string;
-  mediaUrl?: string;      // for video/audio/image
-  slideUrl?: string;      // for slide
+  mediaUrl?: string;
+  slideUrl?: string;
 };
 
 const uid = () => Math.random().toString(36).slice(2, 9);
@@ -26,7 +26,6 @@ const endOf = (s: Segment) => s.start + lenOf(s);
 const overlaps = (a: { start: number; end: number }, b: { start: number; end: number }) =>
   a.start < b.end - 1e-3 && b.start < a.end - 1e-3;
 
-/** Find smallest layer index where placing [start, start+len) does not conflict, ignoring `ignoreId`. */
 function findFreeLayer(segs: Segment[], start: number, len: number, ignoreId?: string, preferred?: number): number {
   const end = start + len;
   const tryLayer = (L: number) =>
@@ -42,6 +41,7 @@ export default function EditStudio() {
   const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
   const ovVideoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
   const timelineScrollRef = useRef<HTMLDivElement>(null);
+  const timelineContentRef = useRef<HTMLDivElement>(null);
   const [time, setTime] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [chaptersOpen, setChaptersOpen] = useState(false);
@@ -49,6 +49,14 @@ export default function EditStudio() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const selectedId = selectedIds.size === 1 ? Array.from(selectedIds)[0] : null;
   const [zoom, setZoom] = useState(1);
+
+  // ===== Dual markers (in/out) =====
+  const [markerIn, setMarkerIn] = useState<number | null>(null);
+  const [markerOut, setMarkerOut] = useState<number | null>(null);
+
+  // ===== Rubber-band selection =====
+  const [rubberBand, setRubberBand] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null);
+  const isRubberBanding = useRef(false);
 
   const toggleSelect = (id: string, additive: boolean) => {
     setSelectedIds((prev) => {
@@ -60,7 +68,7 @@ export default function EditStudio() {
   };
   const clearSelection = () => setSelectedIds(new Set());
 
-  // Build initial segments from recording — or a blank slide if starting fresh
+  // Build initial segments
   useEffect(() => {
     if (segments.length > 0) return;
     if (!recording) {
@@ -87,7 +95,7 @@ export default function EditStudio() {
     setSegments(initial);
   }, [recording]); // eslint-disable-line
 
-  // Append new recording at end of timeline
+  // Append new recording
   useEffect(() => {
     if (!appendRecording) return;
     const r = appendRecording;
@@ -121,7 +129,6 @@ export default function EditStudio() {
     [segments],
   );
 
-  // Active segments at current time, sorted by layer (top first)
   const active = useMemo(
     () => segments.filter((s) => time >= s.start && time < endOf(s)).sort((a, b) => a.layer - b.layer),
     [segments, time],
@@ -131,7 +138,6 @@ export default function EditStudio() {
   const overlayImages = active.filter((s) => s.kind === "image");
   const activeAudios = active.filter((s) => s.kind === "audio" || s.kind === "video");
 
-  // Sync main video element src
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
@@ -139,7 +145,6 @@ export default function EditStudio() {
     if (!v.src.includes(mainVideo.mediaUrl)) v.src = mainVideo.mediaUrl;
   }, [mainVideo?.mediaUrl]);
 
-  // Playback loop
   useEffect(() => {
     if (!playing) return;
     let raf = 0; let last = performance.now();
@@ -156,7 +161,6 @@ export default function EditStudio() {
     return () => cancelAnimationFrame(raf);
   }, [playing, duration]);
 
-  // Sync media to playhead/playing
   useEffect(() => {
     const v = videoRef.current;
     if (v && mainVideo) {
@@ -176,8 +180,6 @@ export default function EditStudio() {
       } else el.pause();
     });
   }, [time, playing, mainVideo, activeAudios, segments]);
-
-  // (No early return — editor opens with a blank slide when no recording exists.)
 
   // ===== ops =====
   const seek = (t: number) => setTime(Math.max(0, Math.min(duration, t)));
@@ -217,13 +219,45 @@ export default function EditStudio() {
     setSelectedIds(new Set());
   };
 
-  /** Trim by source delta. Prevents overlap with same-layer neighbours by clamping. */
+  // Delete segments between markers (in/out region)
+  const deleteMarkerRegion = () => {
+    if (markerIn === null || markerOut === null) return;
+    const lo = Math.min(markerIn, markerOut);
+    const hi = Math.max(markerIn, markerOut);
+    // Split and remove the region [lo, hi] from all segments that overlap
+    setSegments((prev) => {
+      const result: Segment[] = [];
+      for (const s of prev) {
+        const sEnd = endOf(s);
+        // Fully outside region
+        if (sEnd <= lo || s.start >= hi) {
+          result.push(s);
+          continue;
+        }
+        // Fully inside region — skip (delete)
+        if (s.start >= lo && sEnd <= hi) continue;
+        // Partially overlapping — keep parts outside
+        if (s.start < lo) {
+          const trimEnd = lo - s.start;
+          result.push({ ...s, id: uid(), srcEnd: s.srcStart + trimEnd });
+        }
+        if (sEnd > hi) {
+          const trimStart = hi - s.start;
+          result.push({ ...s, id: uid(), srcStart: s.srcStart + trimStart, start: hi });
+        }
+      }
+      return result;
+    });
+    toast.success(`Região ${fmt(lo)} → ${fmt(hi)} removida`);
+    setMarkerIn(null);
+    setMarkerOut(null);
+  };
+
   const trim = (id: string, edge: "start" | "end", deltaSec: number) => {
     setSegments((prev) => prev.map((s) => {
       if (s.id !== id) return s;
       const sameLayer = prev.filter((x) => x.id !== id && x.layer === s.layer);
       if (edge === "start") {
-        const minSrc = Math.max(0, s.srcStart - (s.start));
         let newSrcStart = Math.max(0, Math.min(s.srcEnd - 0.1, s.srcStart + deltaSec));
         let newStart = s.start + (newSrcStart - s.srcStart);
         const prevSeg = sameLayer.filter((x) => endOf(x) <= s.start + 1e-3).sort((a, b) => endOf(b) - endOf(a))[0];
@@ -246,7 +280,6 @@ export default function EditStudio() {
     }));
   };
 
-  /** Move a segment (and other selected segments as a group). */
   const moveSegment = (id: string, newStart: number, targetLayer: number) => {
     setSegments((prev) => {
       const seg = prev.find((s) => s.id === id);
@@ -319,31 +352,115 @@ export default function EditStudio() {
     window.addEventListener("mouseup", up);
   };
 
-  // chapters: derive from slide segments sorted by start
+  // ===== Rubber-band selection on empty track area =====
+  const onTimelineMouseDown = useCallback((e: React.MouseEvent) => {
+    // Only start rubber-band if clicking on the track background (not on a segment)
+    const target = e.target as HTMLElement;
+    if (target.closest("[data-segment]") || target.closest("[data-handle]") || target.dataset.handle) return;
+    if (target.closest("[data-ruler]")) return;
+
+    const container = timelineContentRef.current;
+    if (!container) return;
+
+    const containerRect = container.getBoundingClientRect();
+    const startX = e.clientX - containerRect.left;
+    const startY = e.clientY - containerRect.top;
+
+    isRubberBanding.current = true;
+    setRubberBand({ startX, startY, endX: startX, endY: startY });
+
+    if (!e.ctrlKey && !e.metaKey && !e.shiftKey) {
+      setSelectedIds(new Set());
+    }
+
+    const move = (ev: MouseEvent) => {
+      const endX = ev.clientX - containerRect.left;
+      const endY = ev.clientY - containerRect.top;
+      setRubberBand({ startX, startY, endX, endY });
+
+      // Calculate which segments intersect the rubber band
+      const rbLeft = (Math.min(startX, endX) - 80) / PX_PER_SEC;
+      const rbRight = (Math.max(startX, endX) - 80) / PX_PER_SEC;
+      const layerHeight = 44; // approximate row height
+      const rulerHeight = 28;
+      const rbTopLayer = Math.floor((Math.min(startY, endY) - rulerHeight) / layerHeight);
+      const rbBottomLayer = Math.floor((Math.max(startY, endY) - rulerHeight) / layerHeight);
+
+      const newSel = new Set<string>();
+      if (ev.ctrlKey || ev.metaKey || ev.shiftKey) {
+        selectedIds.forEach((id) => newSel.add(id));
+      }
+      for (const s of segments) {
+        const sEnd = endOf(s);
+        if (s.start < rbRight && sEnd > rbLeft && s.layer >= rbTopLayer && s.layer <= rbBottomLayer) {
+          newSel.add(s.id);
+        }
+      }
+      setSelectedIds(newSel);
+    };
+
+    const up = () => {
+      isRubberBanding.current = false;
+      setRubberBand(null);
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  }, [PX_PER_SEC, segments, selectedIds]);
+
+  // Set marker in at current time
+  const setMarkerInAtTime = () => {
+    setMarkerIn(time);
+    toast.success(`Marcador IN → ${fmt(time)}`);
+  };
+  const setMarkerOutAtTime = () => {
+    setMarkerOut(time);
+    toast.success(`Marcador OUT → ${fmt(time)}`);
+  };
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "i" || e.key === "I") { setMarkerIn(time); toast.success(`IN → ${fmt(time)}`); }
+      if (e.key === "o" || e.key === "O") { setMarkerOut(time); toast.success(`OUT → ${fmt(time)}`); }
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (selectedIds.size > 0) deleteSelected();
+      }
+      if (e.key === " ") { e.preventDefault(); toggle(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [time, selectedIds]); // eslint-disable-line
+
   const chapters = segments
     .filter((s) => s.kind === "slide")
     .sort((a, b) => a.start - b.start)
     .map((s) => ({ slideId: s.id, time: s.start, end: endOf(s), slide: { name: s.label } }));
 
+  const hasMarkerRegion = markerIn !== null && markerOut !== null;
+  const markerLo = hasMarkerRegion ? Math.min(markerIn!, markerOut!) : 0;
+  const markerHi = hasMarkerRegion ? Math.max(markerIn!, markerOut!) : 0;
+
   return (
     <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-background">
       <header className="flex items-center justify-between border-b border-border px-4 py-3">
         <div className="flex items-center gap-2">
-          <button onClick={() => setView("home")} className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90">
+          <button onClick={() => setView("home")} className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90">
             <ArrowLeft className="h-4 w-4" /> Voltar
           </button>
-          <button onClick={() => setChaptersOpen(true)} className="flex items-center gap-1.5 rounded-md bg-card px-3 py-1.5 text-sm ring-1 ring-border hover:bg-muted">
+          <button onClick={() => setChaptersOpen(true)} className="flex items-center gap-1.5 rounded-md bg-card px-3 py-1.5 text-sm ring-1 ring-border transition-colors hover:bg-muted">
             <List className="h-4 w-4" /> Capítulos
           </button>
-          <button onClick={() => setView("record")} className="flex items-center gap-1.5 rounded-md bg-card px-3 py-1.5 text-sm ring-1 ring-border hover:bg-muted">
+          <button onClick={() => setView("record")} className="flex items-center gap-1.5 rounded-md bg-card px-3 py-1.5 text-sm ring-1 ring-border transition-colors hover:bg-muted">
             <Video className="h-4 w-4" /> Gravar nova cena
           </button>
-          <label className="flex cursor-pointer items-center gap-1.5 rounded-md bg-card px-3 py-1.5 text-sm ring-1 ring-border hover:bg-muted">
+          <label className="flex cursor-pointer items-center gap-1.5 rounded-md bg-card px-3 py-1.5 text-sm ring-1 ring-border transition-colors hover:bg-muted">
             <Upload className="h-4 w-4" /> Mídia
             <input type="file" accept="image/*,video/*,audio/*" multiple className="hidden" onChange={(e) => onUploadMedia(e.target.files)} />
           </label>
         </div>
-        <button onClick={() => toast.success("Projeto salvo")} className="flex items-center gap-1.5 rounded-md bg-[hsl(var(--rec))] px-3 py-1.5 text-sm font-medium text-white hover:opacity-90">
+        <button onClick={() => toast.success("Projeto salvo")} className="flex items-center gap-1.5 rounded-md bg-[hsl(var(--rec))] px-3 py-1.5 text-sm font-medium text-white transition-colors hover:opacity-90">
           <Save className="h-4 w-4" /> Salvar
         </button>
       </header>
@@ -374,16 +491,16 @@ export default function EditStudio() {
           window.addEventListener("mousemove", move);
           window.addEventListener("mouseup", up);
         }}>
-          <div className="absolute left-0 top-0 h-1 rounded-full bg-[hsl(var(--rec))]" style={{ width: `${(time / duration) * 100}%` }} />
-          <div className="absolute -top-1 h-3 w-3 -translate-x-1/2 rounded-full bg-[hsl(var(--rec))]" style={{ left: `${(time / duration) * 100}%` }} />
+          <div className="absolute left-0 top-0 h-1 rounded-full bg-[hsl(var(--rec))] transition-[width] duration-75" style={{ width: `${(time / duration) * 100}%` }} />
+          <div className="absolute -top-1 h-3 w-3 -translate-x-1/2 rounded-full bg-[hsl(var(--rec))] transition-[left] duration-75" style={{ left: `${(time / duration) * 100}%` }} />
         </div>
         <div className="mt-2 flex items-center justify-between">
           <div className="flex items-center gap-1">
-            <button onClick={() => seek(0)} className="rounded-full p-1.5 hover:bg-muted"><SkipBack className="h-4 w-4" /></button>
-            <button onClick={toggle} className="rounded-full bg-primary p-1.5 text-primary-foreground hover:bg-primary/90">
+            <button onClick={() => seek(0)} className="rounded-full p-1.5 transition-colors hover:bg-muted"><SkipBack className="h-4 w-4" /></button>
+            <button onClick={toggle} className="rounded-full bg-primary p-1.5 text-primary-foreground transition-all hover:bg-primary/90 hover:scale-105 active:scale-95">
               {playing ? <Pause className="h-4 w-4 fill-current" /> : <Play className="h-4 w-4 fill-current" />}
             </button>
-            <button onClick={() => seek(duration)} className="rounded-full p-1.5 hover:bg-muted"><SkipForward className="h-4 w-4" /></button>
+            <button onClick={() => seek(duration)} className="rounded-full p-1.5 transition-colors hover:bg-muted"><SkipForward className="h-4 w-4" /></button>
           </div>
           <div className="text-xs text-muted-foreground">{mainSlide?.label ?? "—"}</div>
           <div className="flex items-center gap-3 text-xs text-muted-foreground">
@@ -395,31 +512,53 @@ export default function EditStudio() {
       </div>
 
       {/* edit toolbar */}
-      <div className="mt-2 flex items-center gap-2 px-4">
-        <button onClick={splitAtPlayhead} disabled={selectedIds.size === 0} className="flex items-center gap-1.5 rounded-md bg-card px-2.5 py-1.5 text-xs ring-1 ring-border hover:bg-muted disabled:opacity-40">
+      <div className="mt-2 flex items-center gap-2 px-4 flex-wrap">
+        <button onClick={splitAtPlayhead} disabled={selectedIds.size === 0} className="flex items-center gap-1.5 rounded-md bg-card px-2.5 py-1.5 text-xs ring-1 ring-border transition-all hover:bg-muted disabled:opacity-40">
           <Scissors className="h-3.5 w-3.5" /> Dividir{selectedIds.size > 1 ? ` (${selectedIds.size})` : ""}
         </button>
-        <button onClick={deleteSelected} disabled={selectedIds.size === 0} className="flex items-center gap-1.5 rounded-md bg-card px-2.5 py-1.5 text-xs ring-1 ring-border hover:bg-muted disabled:opacity-40">
+        <button onClick={deleteSelected} disabled={selectedIds.size === 0} className="flex items-center gap-1.5 rounded-md bg-card px-2.5 py-1.5 text-xs ring-1 ring-border transition-all hover:bg-muted disabled:opacity-40">
           <Trash2 className="h-3.5 w-3.5" /> Apagar{selectedIds.size > 1 ? ` (${selectedIds.size})` : ""}
         </button>
         {selectedIds.size > 0 && (
-          <button onClick={clearSelection} className="rounded-md bg-card px-2.5 py-1.5 text-xs ring-1 ring-border hover:bg-muted">
+          <button onClick={clearSelection} className="rounded-md bg-card px-2.5 py-1.5 text-xs ring-1 ring-border transition-all hover:bg-muted">
             Limpar seleção
           </button>
         )}
+
+        <div className="h-4 w-px bg-border mx-1" />
+
+        {/* Marker buttons */}
+        <button onClick={setMarkerInAtTime} className="flex items-center gap-1 rounded-md bg-emerald-500/20 px-2.5 py-1.5 text-xs text-emerald-400 ring-1 ring-emerald-500/40 transition-all hover:bg-emerald-500/30">
+          IN {markerIn !== null && <span className="font-mono text-[10px] opacity-70">{fmt(markerIn)}</span>}
+        </button>
+        <button onClick={setMarkerOutAtTime} className="flex items-center gap-1 rounded-md bg-rose-500/20 px-2.5 py-1.5 text-xs text-rose-400 ring-1 ring-rose-500/40 transition-all hover:bg-rose-500/30">
+          OUT {markerOut !== null && <span className="font-mono text-[10px] opacity-70">{fmt(markerOut)}</span>}
+        </button>
+        {hasMarkerRegion && (
+          <>
+            <button onClick={deleteMarkerRegion} className="flex items-center gap-1.5 rounded-md bg-destructive/20 px-2.5 py-1.5 text-xs text-destructive ring-1 ring-destructive/40 transition-all hover:bg-destructive/30">
+              <Scissors className="h-3.5 w-3.5" /> Cortar região
+            </button>
+            <button onClick={() => { setMarkerIn(null); setMarkerOut(null); }} className="rounded-md bg-card px-2.5 py-1.5 text-xs ring-1 ring-border transition-all hover:bg-muted">
+              Limpar marcadores
+            </button>
+          </>
+        )}
+
         <div className="ml-auto flex items-center gap-1 text-xs text-muted-foreground">
-          <button onClick={() => setZoom((z) => Math.max(0.4, z - 0.2))} className="rounded-md px-2 py-1 hover:bg-muted">−</button>
+          <button onClick={() => setZoom((z) => Math.max(0.4, z - 0.2))} className="rounded-md px-2 py-1 transition-colors hover:bg-muted">−</button>
           Zoom {Math.round(zoom * 100)}%
-          <button onClick={() => setZoom((z) => Math.min(4, z + 0.2))} className="rounded-md px-2 py-1 hover:bg-muted">+</button>
+          <button onClick={() => setZoom((z) => Math.min(4, z + 0.2))} className="rounded-md px-2 py-1 transition-colors hover:bg-muted">+</button>
         </div>
       </div>
 
       {/* Timeline */}
-      <div ref={timelineScrollRef} className="mt-2 flex-1 overflow-auto bg-[hsl(var(--timeline-bg))] px-2 pb-4 scrollbar-thin">
-        <div className="relative" style={{ width: trackPxWidth + 80 }}>
-          <div className="flex">
+      <div ref={timelineScrollRef} className="mt-2 flex-1 overflow-auto bg-[hsl(var(--timeline-bg))] px-2 pb-4 scrollbar-thin select-none">
+        <div ref={timelineContentRef} className="relative" style={{ width: trackPxWidth + 80 }} onMouseDown={onTimelineMouseDown}>
+          {/* Ruler */}
+          <div className="flex" data-ruler>
             <div className="w-20 shrink-0" />
-            <div onMouseDown={onRulerMouseDown} className="relative cursor-pointer select-none border-b border-border/60 text-[10px] text-muted-foreground" style={{ width: trackPxWidth }}>
+            <div onMouseDown={onRulerMouseDown} data-ruler className="relative cursor-pointer select-none border-b border-border/60 text-[10px] text-muted-foreground" style={{ width: trackPxWidth }}>
               <div className="flex">
                 {Array.from({ length: ticks }).map((_, i) => (
                   <div key={i} style={{ width: PX_PER_SEC }} className="border-l border-border/40 px-1 py-1">{fmt(i)}</div>
@@ -428,6 +567,7 @@ export default function EditStudio() {
             </div>
           </div>
 
+          {/* Layers */}
           {Array.from({ length: layerCount }).map((_, layerIdx) => (
             <LayerRow
               key={layerIdx}
@@ -442,10 +582,44 @@ export default function EditStudio() {
             />
           ))}
 
-          {/* playhead */}
+          {/* Marker region highlight */}
+          {hasMarkerRegion && (
+            <div
+              className="absolute top-0 bottom-0 pointer-events-none"
+              style={{
+                left: 80 + markerLo * PX_PER_SEC,
+                width: (markerHi - markerLo) * PX_PER_SEC,
+                background: "linear-gradient(180deg, hsla(0,70%,50%,0.12) 0%, hsla(0,70%,50%,0.06) 100%)",
+                borderLeft: "2px solid hsl(142, 71%, 45%)",
+                borderRight: "2px solid hsl(0, 84%, 60%)",
+              }}
+            />
+          )}
+
+          {/* Marker IN */}
+          {markerIn !== null && (
+            <MarkerHandle
+              position={80 + markerIn * PX_PER_SEC}
+              color="hsl(142, 71%, 45%)"
+              label="IN"
+              onDrag={(dx) => setMarkerIn((prev) => Math.max(0, Math.min(duration, (prev ?? 0) + dx / PX_PER_SEC)))}
+            />
+          )}
+
+          {/* Marker OUT */}
+          {markerOut !== null && (
+            <MarkerHandle
+              position={80 + markerOut * PX_PER_SEC}
+              color="hsl(0, 84%, 60%)"
+              label="OUT"
+              onDrag={(dx) => setMarkerOut((prev) => Math.max(0, Math.min(duration, (prev ?? 0) + dx / PX_PER_SEC)))}
+            />
+          )}
+
+          {/* Playhead */}
           <div
-            className="absolute top-0 bottom-0 w-px cursor-grab active:cursor-grabbing bg-[hsl(var(--rec))]"
-            style={{ left: 80 + time * PX_PER_SEC }}
+            className="absolute top-0 bottom-0 w-px cursor-grab active:cursor-grabbing"
+            style={{ left: 80 + time * PX_PER_SEC, background: "hsl(var(--rec))", transition: playing ? "none" : "left 0.05s ease-out" }}
             onMouseDown={(e) => {
               e.preventDefault();
               const scrollEl = timelineScrollRef.current;
@@ -464,14 +638,83 @@ export default function EditStudio() {
               window.addEventListener("mouseup", up);
             }}
           >
-            <div className="absolute -top-1 -left-[5px] h-2.5 w-2.5 rotate-45 cursor-grab active:cursor-grabbing bg-[hsl(var(--rec))]" />
+            <div className="absolute -top-0.5 -left-[6px] w-[13px] h-[13px] rounded-sm rotate-45 cursor-grab active:cursor-grabbing" style={{ background: "hsl(var(--rec))" }} />
           </div>
+
+          {/* Rubber band selection rectangle */}
+          {rubberBand && (
+            <div
+              className="absolute pointer-events-none rounded border border-primary/60 z-50"
+              style={{
+                left: Math.min(rubberBand.startX, rubberBand.endX),
+                top: Math.min(rubberBand.startY, rubberBand.endY),
+                width: Math.abs(rubberBand.endX - rubberBand.startX),
+                height: Math.abs(rubberBand.endY - rubberBand.startY),
+                background: "hsla(var(--primary), 0.08)",
+              }}
+            />
+          )}
         </div>
+      </div>
+
+      {/* Hint bar */}
+      <div className="flex items-center gap-4 border-t border-border bg-card/50 px-4 py-1.5 text-[10px] text-muted-foreground">
+        <span><kbd className="rounded bg-muted px-1 py-0.5 text-[9px] font-mono">I</kbd> Marcador IN</span>
+        <span><kbd className="rounded bg-muted px-1 py-0.5 text-[9px] font-mono">O</kbd> Marcador OUT</span>
+        <span><kbd className="rounded bg-muted px-1 py-0.5 text-[9px] font-mono">Ctrl</kbd>+Click Seleção múltipla</span>
+        <span><MousePointer2 className="h-3 w-3 inline" /> Arraste para selecionar</span>
+        <span><kbd className="rounded bg-muted px-1 py-0.5 text-[9px] font-mono">Space</kbd> Play/Pause</span>
+        <span><kbd className="rounded bg-muted px-1 py-0.5 text-[9px] font-mono">Del</kbd> Apagar seleção</span>
       </div>
     </div>
   );
 }
 
+// ===== Draggable Marker Handle =====
+function MarkerHandle({ position, color, label, onDrag }: {
+  position: number;
+  color: string;
+  label: string;
+  onDrag: (deltaPx: number) => void;
+}) {
+  const onDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    let last = e.clientX;
+    const move = (ev: MouseEvent) => {
+      const d = ev.clientX - last;
+      last = ev.clientX;
+      onDrag(d);
+    };
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
+
+  return (
+    <div
+      className="absolute top-0 bottom-0 w-0.5 cursor-ew-resize z-30"
+      style={{ left: position, background: color }}
+      onMouseDown={onDown}
+    >
+      <div
+        className="absolute -top-1 -left-[10px] flex items-center justify-center w-[21px] h-4 rounded-sm text-[8px] font-bold text-white cursor-ew-resize select-none"
+        style={{ background: color }}
+      >
+        {label}
+      </div>
+      <div
+        className="absolute -bottom-1 -left-[4px] w-[9px] h-[9px] rotate-45"
+        style={{ background: color }}
+      />
+    </div>
+  );
+}
+
+// ===== Preview Area (unchanged logic) =====
 function PreviewArea({
   videoRef,
   mainVideo,
@@ -540,7 +783,7 @@ function PreviewArea({
           <div className="flex flex-col items-center gap-3 text-center text-muted-foreground">
             <ImageIcon className="h-10 w-10 opacity-40" />
             <div className="text-sm">Slide em branco</div>
-            <div className="text-xs opacity-70">Use “Mídia” ou “Gravar nova cena” para começar</div>
+            <div className="text-xs opacity-70">Use "Mídia" ou "Gravar nova cena" para começar</div>
           </div>
         ) : !mainSlide && overlayImages.length === 0 && !mainVideo ? (
           <div className="text-muted-foreground text-sm">Sem slide ativo</div>
@@ -616,6 +859,7 @@ function LayerRow({ layerIdx, segs, pxPerSec, totalPx, selectedIds, toggleSelect
           return (
             <div
               key={s.id}
+              data-segment
               draggable
               onDragStart={(e) => {
                 const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -626,14 +870,15 @@ function LayerRow({ layerIdx, segs, pxPerSec, totalPx, selectedIds, toggleSelect
               }}
               onMouseDown={(e) => {
                 if ((e.target as HTMLElement).dataset.handle) return;
+                e.stopPropagation(); // prevent rubber-band
                 const additive = e.shiftKey || e.metaKey || e.ctrlKey;
                 if (additive || !selected) toggleSelect(s.id, additive);
               }}
-              className={`group absolute inset-y-0.5 cursor-grab overflow-hidden rounded ring-1 ${style.color} ${selected ? "outline outline-2 outline-[hsl(var(--rec))]" : ""}`}
+              className={`group absolute inset-y-0.5 cursor-grab overflow-hidden rounded ring-1 transition-all duration-100 ${style.color} ${selected ? "outline outline-2 outline-[hsl(var(--rec))] scale-[1.02] z-10" : "hover:brightness-110"}`}
               style={{ left, width }}
             >
               <div className="flex h-full items-center gap-1 px-1.5 text-[10px] text-foreground/90">
-                <style.Icon className="h-3 w-3 opacity-70" />
+                <style.Icon className="h-3 w-3 opacity-70 shrink-0" />
                 <span className="truncate">{s.label}</span>
               </div>
               <Handle onDrag={(d) => trim(s.id, "start", d / pxPerSec)} side="left" />
@@ -657,6 +902,6 @@ function Handle({ side, onDrag }: { side: "left" | "right"; onDrag: (deltaPx: nu
   };
   return (
     <div data-handle="1" onMouseDown={onDown}
-      className={`absolute inset-y-0 w-1.5 cursor-ew-resize bg-foreground/40 opacity-0 transition group-hover:opacity-100 ${side === "left" ? "left-0" : "right-0"}`} />
+      className={`absolute inset-y-0 w-1.5 cursor-ew-resize bg-foreground/40 opacity-0 transition-opacity duration-150 group-hover:opacity-100 ${side === "left" ? "left-0" : "right-0"}`} />
   );
 }
